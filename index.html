@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Codex — A Magic Card Archive</title>
+<link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+
+<header class="cabinet-header">
+  <h1>Codex</h1>
+  <div class="tagline">a card catalog for a Magic collection</div>
+</header>
+
+<nav class="drawer-tabs" id="tabs">
+  <button class="drawer-tab active" data-tab="collection">Collection</button>
+  <button class="drawer-tab" data-tab="decks">Decks</button>
+  <button class="drawer-tab" data-tab="assistant">Assistant</button>
+  <button class="drawer-tab" data-tab="storage">Storage Map</button>
+  <button class="drawer-tab" data-tab="io">Import · Export</button>
+</nav>
+
+<main class="drawer-body" id="drawer-body">
+  <!-- populated by app.js -->
+</main>
+
+<div id="modal-root"></div>
+<div id="print-area"></div>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
