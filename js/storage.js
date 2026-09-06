@@ -1,8 +1,11 @@
 // storage.js — persistence + the Dewey-inspired location code system
-// Everything lives in the browser's localStorage. Export/Import (see app.js)
-// is the backup mechanism since localStorage does not sync across devices.
+// Data is synced to Supabase (one row per logged-in user), with a
+// localStorage copy kept per-user as an instant-load / offline cache.
+// Every Storage method below stays synchronous against the in-memory `db`
+// object — see initForUser() for how that object gets populated after login,
+// and save() for how edits get pushed to the cloud in the background.
 
-const DB_KEY = "codex.db.v1";
+import { supabase } from "./supabaseClient.js";
 
 const CLASS_TABLE = [
   { code: "000", label: "Artifact / Colorless", test: (c) => c.colors.length === 0 && !c.isLand && !c.isToken },
@@ -63,35 +66,168 @@ function defaultDB() {
   };
 }
 
-function load() {
+function mergeWithDefaults(parsed) {
+  return { ...defaultDB(), ...parsed, settings: { ...defaultDB().settings, ...(parsed.settings || {}) } };
+}
+
+let db = defaultDB();
+let currentUserId = null; // the logged-in person
+let currentUserEmail = null;
+let activeOwnerId = null; // whose codex_data row is currently loaded — equals currentUserId unless viewing a shared collection
+let activePermission = "owner"; // "owner" | "edit" | "view"
+let cloudSaveTimer = null;
+let onSyncStatus = () => {}; // optional callback: (status) => void, "saved" | "saving" | "error" | "readonly-blocked"
+
+function cacheKeyFor(userId) {
+  return `codex.db.v1.${userId}`;
+}
+
+function writeLocalCache() {
+  if (!currentUserId || activeOwnerId !== currentUserId) return; // only cache your own collection locally
   try {
-    const raw = localStorage.getItem(DB_KEY);
-    if (!raw) return defaultDB();
-    const parsed = JSON.parse(raw);
-    return { ...defaultDB(), ...parsed, settings: { ...defaultDB().settings, ...(parsed.settings || {}) } };
+    localStorage.setItem(cacheKeyFor(currentUserId), JSON.stringify(db));
   } catch (e) {
-    console.error("Failed to load Codex database, starting fresh.", e);
-    return defaultDB();
+    console.warn("Local cache write failed", e);
   }
 }
 
-function save(db) {
-  localStorage.setItem(DB_KEY, JSON.stringify(db));
+async function pushToCloud() {
+  if (!activeOwnerId) return;
+  onSyncStatus("saving");
+  const { error } = await supabase
+    .from("codex_data")
+    .upsert({ user_id: activeOwnerId, data: db, updated_at: new Date().toISOString() });
+  onSyncStatus(error ? "error" : "saved");
+  if (error) console.error("Supabase save failed", error);
 }
 
-let db = load();
+function save(db_) {
+  writeLocalCache();
+  clearTimeout(cloudSaveTimer);
+  cloudSaveTimer = setTimeout(pushToCloud, 800); // debounce rapid edits into one write
+}
 
 function uid() {
   return "id-" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 }
 
-export const Storage = {
+const StorageImpl = {
+  // Called once after a successful login. Loads this user's data from
+  // Supabase (falling back to a local cache for instant paint, and to a
+  // fresh empty database for a brand-new account).
+  async initForUser(userId, email, statusCallback) {
+    currentUserId = userId;
+    currentUserEmail = email;
+    activeOwnerId = userId;
+    activePermission = "owner";
+    onSyncStatus = statusCallback || (() => {});
+    try {
+      const cached = localStorage.getItem(cacheKeyFor(userId));
+      if (cached) db = mergeWithDefaults(JSON.parse(cached));
+    } catch (e) { /* ignore bad cache */ }
+
+    const { data, error } = await supabase.from("codex_data").select("data").eq("user_id", userId).maybeSingle();
+    if (error) {
+      console.error("Failed to load from Supabase, using local cache if any.", error);
+      onSyncStatus("error");
+      return;
+    }
+    if (data && data.data) {
+      db = mergeWithDefaults(data.data);
+      writeLocalCache();
+    } else {
+      // Brand-new account — create their row.
+      db = defaultDB();
+      await pushToCloud();
+    }
+    onSyncStatus("saved");
+  },
+
+  signOut() {
+    currentUserId = null;
+    currentUserEmail = null;
+    activeOwnerId = null;
+    activePermission = "owner";
+    db = defaultDB();
+  },
+
+  getMyUserId() {
+    return currentUserId;
+  },
+
+  getActiveOwnerId() {
+    return activeOwnerId;
+  },
+
+  isViewingOwnCollection() {
+    return activeOwnerId === currentUserId;
+  },
+
+  isReadOnly() {
+    return activePermission === "view";
+  },
+
+  getActivePermission() {
+    return activePermission;
+  },
+
+  // ---- Sharing ----
+  // People you've shared your OWN collection with.
+  async listMyCollaborators() {
+    const { data, error } = await supabase.from("collaborators").select("*").eq("owner_id", currentUserId).order("collaborator_email");
+    if (error) throw error;
+    return data || [];
+  },
+
+  // Collections other people have shared with you.
+  async listSharedWithMe() {
+    const { data, error } = await supabase.from("collaborators").select("*").eq("collaborator_id", currentUserId).order("owner_email");
+    if (error) throw error;
+    return data || [];
+  },
+
+  async inviteCollaborator(email, accessLevel) {
+    const { error } = await supabase.rpc("invite_collaborator", { collaborator_email: email.trim(), access_level: accessLevel });
+    if (error) throw error;
+  },
+
+  async updateCollaboratorPermission(rowId, accessLevel) {
+    const { error } = await supabase.from("collaborators").update({ permission: accessLevel }).eq("id", rowId);
+    if (error) throw error;
+  },
+
+  async revokeCollaborator(rowId) {
+    const { error } = await supabase.from("collaborators").delete().eq("id", rowId);
+    if (error) throw error;
+  },
+
+  // Switch which collection is currently loaded — your own, or one shared with you.
+  async switchToOwner(ownerId, permission, statusCallback) {
+    if (statusCallback) onSyncStatus = statusCallback;
+    activeOwnerId = ownerId;
+    activePermission = ownerId === currentUserId ? "owner" : permission;
+    const { data, error } = await supabase.from("codex_data").select("data").eq("user_id", ownerId).maybeSingle();
+    if (error) {
+      console.error("Failed to load that shared collection.", error);
+      onSyncStatus("error");
+      db = defaultDB();
+      return;
+    }
+    db = data && data.data ? mergeWithDefaults(data.data) : defaultDB();
+    writeLocalCache();
+    onSyncStatus("saved");
+  },
+
+  async switchToMine(statusCallback) {
+    return this.switchToOwner(currentUserId, "owner", statusCallback);
+  },
+
   getDB() {
     return db;
   },
 
   replaceDB(newDB) {
-    db = { ...defaultDB(), ...newDB, settings: { ...defaultDB().settings, ...(newDB.settings || {}) } };
+    db = mergeWithDefaults(newDB);
     save(db);
   },
 
@@ -161,7 +297,7 @@ export const Storage = {
 
   // ---- Decks ----
   addDeck(deck) {
-    const record = { id: uid(), cards: [], notes: "", dateCreated: new Date().toISOString(), ...deck };
+    const record = { id: uid(), cards: [], extraCards: [], notes: "", dateCreated: new Date().toISOString(), ...deck };
     db.decks.push(record);
     save(db);
     return record;
@@ -200,6 +336,46 @@ export const Storage = {
       deck.cards.push({ cardId, quantity });
     }
     save(db);
+  },
+
+  // "Extra" cards: cards added straight to a deck from a general Scryfall
+  // search, whether or not you own a physical copy. Each carries its own
+  // snapshot of Scryfall data (name, price, colors, etc.) since it may not
+  // exist anywhere in the Collection.
+  addExtraCard(deckId, cardData, quantity = 1) {
+    const deck = this.findDeck(deckId);
+    if (!deck) return;
+    if (!deck.extraCards) deck.extraCards = [];
+    const existing = deck.extraCards.find((c) => c.scryfallId === cardData.scryfallId);
+    if (existing) existing.quantity += quantity;
+    else deck.extraCards.push({ ...cardData, quantity });
+    save(db);
+  },
+
+  setExtraCardQty(deckId, scryfallId, quantity) {
+    const deck = this.findDeck(deckId);
+    if (!deck || !deck.extraCards) return;
+    if (quantity <= 0) {
+      deck.extraCards = deck.extraCards.filter((c) => c.scryfallId !== scryfallId);
+    } else {
+      const entry = deck.extraCards.find((c) => c.scryfallId === scryfallId);
+      if (entry) entry.quantity = quantity;
+    }
+    save(db);
+  },
+
+  // ---- Value ----
+  collectionValue() {
+    return db.cards.reduce((sum, c) => sum + (Number(c.price) || 0) * (c.quantity || 0), 0);
+  },
+
+  deckValue(deck) {
+    const owned = deck.cards.reduce((sum, dc) => {
+      const c = this.findCard(dc.cardId);
+      return sum + (c ? (Number(c.price) || 0) * dc.quantity : 0);
+    }, 0);
+    const extra = (deck.extraCards || []).reduce((sum, c) => sum + (Number(c.price) || 0) * c.quantity, 0);
+    return owned + extra;
   },
 
   // ---- Settings ----
@@ -256,3 +432,30 @@ export const Storage = {
     return counts;
   },
 };
+
+// Every method below is a real database write. When the active collection
+// is someone else's and you only have "view" access, these are blocked here
+// — as a safety net for the UI — on top of the database's own Row Level
+// Security policies, which are the actual enforcement boundary.
+const MUTATING_METHODS = new Set([
+  "replaceDB", "mergeDB", "addCard", "updateCard", "deleteCard",
+  "addDeck", "updateDeck", "deleteDeck", "setDeckCardQty",
+  "addExtraCard", "setExtraCardQty", "updateSettings",
+  "assignLocation", "clearLocation",
+]);
+
+export const Storage = new Proxy(StorageImpl, {
+  get(target, prop) {
+    const value = target[prop];
+    if (typeof value !== "function") return value;
+    if (!MUTATING_METHODS.has(prop)) return value.bind(target);
+    return (...args) => {
+      if (activePermission === "view") {
+        console.warn(`Blocked "${String(prop)}" — you have view-only access to this collection.`);
+        onSyncStatus("readonly-blocked");
+        return null;
+      }
+      return value.apply(target, args);
+    };
+  },
+});

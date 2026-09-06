@@ -207,4 +207,55 @@ function analyzeDeck(deck, deckCardObjects, collection, targetSize = 60) {
   };
 }
 
-export const Assistant = { analyzeDeck };
+/**
+ * Builds Scryfall search queries for the "all Magic cards" assistant mode —
+ * used when the person wants suggestions beyond their own collection.
+ * Results are sorted by Scryfall's order:edhrec, i.e. EDHREC popularity rank,
+ * which is how EDHREC's signal gets folded in without scraping their site.
+ */
+function buildAllCardsQueries(analysis, identity, targetSize) {
+  const idPart = identity && identity.size ? `id<=${Array.from(identity).join("").toLowerCase()}` : "";
+  const queries = [];
+
+  const targetRemoval = Math.max(4, Math.round(targetSize * 0.12));
+  if (analysis.removalInDeck < targetRemoval) {
+    queries.push({
+      label: "Removal",
+      reason: `Only ${analysis.removalInDeck} removal-style effect(s) in the deck.`,
+      query: `${idPart} -t:land (o:"destroy target" or o:"exile target creature" or o:"damage to target creature")`.trim(),
+    });
+  }
+
+  const targetDraw = Math.max(3, Math.round(targetSize * 0.08));
+  if (analysis.drawInDeck < targetDraw) {
+    queries.push({
+      label: "Card draw",
+      reason: `Only ${analysis.drawInDeck} card-draw effect(s) in the deck.`,
+      query: `${idPart} -t:land o:"draw a card"`.trim(),
+    });
+  }
+
+  const curveTotal = Object.values(analysis.curve).reduce((a, b) => a + b, 0) || 1;
+  const highCurve = (analysis.curve["5"] + analysis.curve["6+"]) / curveTotal > 0.25;
+  if (identity.has("G") || highCurve) {
+    queries.push({
+      label: "Ramp",
+      reason: "Curve runs high, or the deck is green — mana acceleration helps.",
+      query: `${idPart} -t:land (o:"search your library for a land" or o:"add {c}{c}" or o:"add two mana")`.trim(),
+    });
+  }
+
+  const landTargetPct = targetSize >= 90 ? 0.37 : 0.4;
+  const landTarget = Math.round(targetSize * landTargetPct);
+  if (analysis.landCount < landTarget - 1) {
+    queries.push({
+      label: "Lands",
+      reason: `Only ${analysis.landCount} lands for a ${targetSize}-card deck.`,
+      query: `${idPart} t:land`.trim(),
+    });
+  }
+
+  return queries;
+}
+
+export const Assistant = { analyzeDeck, buildAllCardsQueries, colorIdentityOf };
