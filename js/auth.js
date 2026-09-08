@@ -99,22 +99,34 @@ function setSyncStatus(status) {
 }
 
 let appStarted = false;
+let appStartPromise = null;
+let collectionSwitchListenerRegistered = false;
 
 async function startApp(user) {
-  authRoot.innerHTML = "";
-  appRoot.style.display = "block";
-  await Storage.initForUser(user.id, user.email, setSyncStatus);
-  renderAccountBar(user);
-  if (!appStarted) {
+  if (appStarted) return;
+  if (appStartPromise) return appStartPromise;
+
+  appStartPromise = (async () => {
+    authRoot.innerHTML = "";
+    appRoot.style.display = "block";
+    await Storage.initForUser(user.id, user.email, setSyncStatus);
+    renderAccountBar(user);
     initApp();
     appStarted = true;
-  } else {
-    // returning from a sign-out/sign-in cycle within the same page load
-    location.reload();
+
+    if (!collectionSwitchListenerRegistered) {
+      window.addEventListener("codex:collection-switched", () => {
+        initApp();
+      });
+      collectionSwitchListenerRegistered = true;
+    }
+  })();
+
+  try {
+    await appStartPromise;
+  } finally {
+    appStartPromise = null;
   }
-  window.addEventListener("codex:collection-switched", () => {
-    initApp();
-  });
 }
 
 supabase.auth.onAuthStateChange((event, session) => {
@@ -123,6 +135,7 @@ supabase.auth.onAuthStateChange((event, session) => {
   } else if (event === "SIGNED_OUT") {
     Storage.signOut();
     appStarted = false;
+    appStartPromise = null;
     renderAuthForm();
   }
 });
