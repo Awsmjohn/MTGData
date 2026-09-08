@@ -9,13 +9,14 @@
 </head>
 <body>
 
-<div id="auth-root"></div>
-
-<div id="app-root" style="display:none;">
 <header class="cabinet-header">
-  <h1>Codex</h1>
-  <div class="tagline">a card catalog for a Magic collection</div>
-  <div id="account-bar" class="account-bar"></div>
+  <div class="header-title">
+    <span class="header-icon" aria-hidden="true">🗂️</span>
+    <div>
+      <h1>Codex</h1>
+      <div class="tagline">your Magic collection, organized</div>
+    </div>
+  </div>
 </header>
 
 <nav class="drawer-tabs" id="tabs">
@@ -23,18 +24,16 @@
   <button class="drawer-tab" data-tab="decks">Decks</button>
   <button class="drawer-tab" data-tab="assistant">Assistant</button>
   <button class="drawer-tab" data-tab="storage">Storage Map</button>
-  <button class="drawer-tab" data-tab="sharing">Sharing</button>
   <button class="drawer-tab" data-tab="io">Import · Export</button>
 </nav>
 
 <main class="drawer-body" id="drawer-body">
   <!-- populated by app.js -->
 </main>
-</div>
 
 <div id="modal-root"></div>
 <div id="print-area"></div>
 
-<script type="module" src="js/auth.js"></script>
+<script type="module" src="js/app.js"></script>
 </body>
 </html>
