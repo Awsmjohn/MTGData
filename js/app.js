@@ -2,6 +2,7 @@ import { Storage } from "./storage.js";
 import { Scryfall } from "./scryfall.js";
 import { Assistant } from "./assistant.js";
 import { Scan } from "./scan.js";
+import { Clippy } from "./clippy.js";
 
 const drawerBody = document.getElementById("drawer-body");
 const modalRoot = document.getElementById("modal-root");
@@ -12,6 +13,9 @@ let state = {
   collectionFilter: { text: "", color: "", tag: "", boxed: "" },
   currentDeckId: null,
   storageBox: null,
+  assistOffset: 0,
+  assistPage: 1,
+  clippyHistory: {}, // deckId -> [{role, content}]
 };
 
 // ---------------- helpers ----------------
@@ -60,15 +64,7 @@ function render() {
   else if (state.tab === "decks") renderDecks();
   else if (state.tab === "assistant") renderAssistant();
   else if (state.tab === "storage") renderStorage();
-  else if (state.tab === "sharing") renderSharing();
   else if (state.tab === "io") renderIO();
-
-  if (Storage.isReadOnly() && state.tab !== "sharing") {
-    const banner = document.createElement("div");
-    banner.className = "readonly-banner";
-    banner.textContent = "You're viewing a shared collection with view-only access — changes here won't save.";
-    drawerBody.prepend(banner);
-  }
 }
 
 // ================= COLLECTION =================
@@ -87,7 +83,18 @@ function renderCollection() {
     return true;
   });
 
+  const isBrandNew = all.length === 0 && Storage.allDecks().length === 0;
+
   drawerBody.innerHTML = `
+    ${isBrandNew ? `
+      <div class="welcome-banner">
+        <div class="welcome-icon">👋</div>
+        <div>
+          <h3>Welcome to Codex!</h3>
+          <p class="hint">This is your card catalog — add a card below (just type its name, Codex fills in the rest), build decks, and get suggestions as your collection grows. Have a stack of physical cards? The <b>📷 Scan</b> button or the CSV bulk import on <b>Import · Export</b> will get you moving fast.</p>
+        </div>
+      </div>
+    ` : ""}
     <div class="toolbar">
       <div class="field"><input id="col-search" placeholder="Search by name…" value="${esc(f.text)}"/></div>
       <div class="field">
@@ -107,14 +114,12 @@ function renderCollection() {
       </div>
       <div class="spacer"></div>
       <div class="hint">Collection value: <b>$${Storage.collectionValue().toFixed(2)}</b></div>
-      ${Storage.isReadOnly() ? "" : `
-        <button id="scan-card-btn">📷 Scan card</button>
-        <button class="primary" id="add-card-btn">+ Add card</button>
-      `}
+      <button id="scan-card-btn">📷 Scan card</button>
+      <button class="primary" id="add-card-btn">+ Add card</button>
     </div>
     ${
       filtered.length === 0
-        ? `<div class="empty-state"><h3>No cards here yet</h3><p class="hint">Add a card by name — Codex pulls the details from Scryfall automatically.</p></div>`
+        ? `<div class="empty-state"><h3>${isBrandNew ? "Your first card goes here" : "No cards match"}</h3><p class="hint">${isBrandNew ? "Add a card by name — Codex pulls the details from Scryfall automatically." : "Try clearing a filter above."}</p></div>`
         : `<div class="card-grid">${filtered.map(cardTile).join("")}</div>`
     }
   `;
@@ -198,7 +203,9 @@ function openAddCardModal(existing, prefillName) {
       <div class="field"><label>Quantity owned</label><input id="card-qty" type="number" min="1" value="${isEdit ? existing.quantity : 1}"/></div>
       <div class="field"><label>Tags (comma-separated)</label><input id="card-tags" value="${isEdit ? esc((existing.tags||[]).join(', ')) : ''}" placeholder="removal, elves"/></div>
     </div>
-    <p class="hint" id="preview-hint">${isEdit ? "Editing keeps the existing card data unless you pick a new name from the list." : prefillName ? "Scanned guess below — confirm it matches one of these before adding." : "Pick a suggestion from the dropdown to pull in card data automatically."}</p>
+    <p class="hint" id="preview-hint">${isEdit ? `Currently: ${esc(existing.set || "unknown set")}${existing.price ? " · $" + Number(existing.price).toFixed(2) : ""}` : prefillName ? "Scanned guess below — confirm it matches one of these before adding." : "Pick a suggestion from the dropdown to pull in card data automatically."}</p>
+    <button id="change-printing-btn" type="button">🖼️ Change printing / edition</button>
+    <div id="printing-picker" class="printing-picker" style="display:none;"></div>
     <div class="modal-close-row">
       <button id="cancel-btn">Cancel</button>
       <button class="primary" id="save-card-btn">${isEdit ? "Save changes" : "Add to Codex"}</button>
@@ -222,7 +229,7 @@ function openAddCardModal(existing, prefillName) {
             root.querySelector("#preview-hint").textContent = "Loading card data…";
             try {
               pendingScryfallData = await Scryfall.getByExactName(row.dataset.name);
-              root.querySelector("#preview-hint").textContent = `Loaded: ${pendingScryfallData.typeLine} — ${pendingScryfallData.manaCost || "no cost"}`;
+              root.querySelector("#preview-hint").textContent = `Loaded: ${pendingScryfallData.typeLine} — ${pendingScryfallData.manaCost || "no cost"} — ${pendingScryfallData.set}${pendingScryfallData.price ? " · $" + Number(pendingScryfallData.price).toFixed(2) : ""}`;
             } catch (err) {
               root.querySelector("#preview-hint").textContent = "Couldn't fetch that card — it will be saved with just the name.";
             }
@@ -237,6 +244,30 @@ function openAddCardModal(existing, prefillName) {
       });
 
       if (!isEdit && prefillName) runAutocomplete(prefillName);
+
+      const pickerEl = root.querySelector("#printing-picker");
+      root.querySelector("#change-printing-btn").addEventListener("click", async () => {
+        const name = nameInput.value.trim();
+        if (!name) return;
+        if (pickerEl.style.display === "block") { pickerEl.style.display = "none"; return; }
+        pickerEl.style.display = "block";
+        pickerEl.innerHTML = `<p class="hint">Loading printings…</p>`;
+        const printings = await Scryfall.getPrintings(name);
+        if (!printings.length) { pickerEl.innerHTML = `<p class="hint">No printings found for that name yet.</p>`; return; }
+        pickerEl.innerHTML = printings.map((p) => `
+          <button type="button" class="printing-tile" data-sfid="${esc(p.scryfallId)}">
+            ${p.imageUrl ? `<img src="${esc(p.imageUrl)}" alt="${esc(p.set)}"/>` : ""}
+            <div class="printing-tile-label">${esc(p.set)}${p.price ? " · $" + Number(p.price).toFixed(2) : ""}</div>
+          </button>
+        `).join("");
+        pickerEl.querySelectorAll(".printing-tile").forEach((btn) =>
+          btn.addEventListener("click", () => {
+            pendingScryfallData = printings.find((p) => p.scryfallId === btn.dataset.sfid);
+            root.querySelector("#preview-hint").textContent = `Selected: ${pendingScryfallData.set}${pendingScryfallData.price ? " · $" + Number(pendingScryfallData.price).toFixed(2) : ""}`;
+            pickerEl.style.display = "none";
+          })
+        );
+      });
 
       root.querySelector("#cancel-btn").addEventListener("click", closeModal);
       root.querySelector("#save-card-btn").addEventListener("click", async () => {
@@ -333,7 +364,7 @@ function renderDecks() {
   if (state.currentDeckId) return renderDeckDetail(state.currentDeckId);
   const decks = Storage.allDecks();
   drawerBody.innerHTML = `
-    <div class="toolbar"><h3 style="margin:0">Your decks</h3><div class="spacer"></div>${Storage.isReadOnly() ? "" : `<button class="primary" id="new-deck-btn">+ New deck</button>`}</div>
+    <div class="toolbar"><h3 style="margin:0">Your decks</h3><div class="spacer"></div><button class="primary" id="new-deck-btn">+ New deck</button></div>
     ${
       decks.length === 0
         ? `<div class="empty-state"><h3>No decks yet</h3><p class="hint">Create a deck, then add cards from your Collection.</p></div>`
@@ -424,6 +455,7 @@ function renderDeckDetail(deckId) {
       <div class="field" style="max-width:120px"><label>Export</label><button id="export-deck-btn" style="width:100%">As text list</button></div>
     </div>
 
+    <div class="deck-table-wrap">
     <table class="deck-table">
       <thead><tr><th>Card</th><th>Colors</th><th>CMC</th><th>Qty</th><th>Owned</th><th>Price</th><th></th></tr></thead>
       <tbody>
@@ -456,7 +488,17 @@ function renderDeckDetail(deckId) {
           </tr>`).join("")}
       </tbody>
     </table>
+    </div>
     ${deck.cards.length === 0 && (deck.extraCards || []).length === 0 ? `<p class="hint">No cards in this deck yet — search above to add from your collection or from anywhere.</p>` : ""}
+
+    <div class="clippy-panel">
+      <div class="clippy-header"><span class="clippy-avatar">📎</span><div><b>Clippy</b><div class="hint">Ask anything about this deck — cuts, additions, combos, strategy.</div></div></div>
+      <div class="clippy-log" id="clippy-log"></div>
+      <div class="row" style="margin-top:.6rem;">
+        <div class="field" style="flex:1; margin-bottom:0;"><input id="clippy-input" placeholder="e.g. What am I missing for a combo finish?"/></div>
+        <button class="primary" id="clippy-send-btn">Ask</button>
+      </div>
+    </div>
   `;
 
   document.getElementById("back-btn").addEventListener("click", () => { state.currentDeckId = null; renderDecks(); });
@@ -538,6 +580,58 @@ function renderDeckDetail(deckId) {
   drawerBody.querySelectorAll("[data-remove]").forEach((btn) =>
     btn.addEventListener("click", () => { Storage.setDeckCardQty(deck.id, btn.dataset.remove, 0); renderDeckDetail(deck.id); })
   );
+
+  renderClippyLog(deck.id);
+  const clippyInput = document.getElementById("clippy-input");
+  const clippySend = document.getElementById("clippy-send-btn");
+  const sendToClippy = () => askClippyAbout(deck, deckCardObjects, clippyInput);
+  clippySend.addEventListener("click", sendToClippy);
+  clippyInput.addEventListener("keydown", (e) => { if (e.key === "Enter") sendToClippy(); });
+}
+
+function buildDeckContext(deck, deckCardObjects) {
+  const lines = [`Deck: ${deck.name} (${deck.format || "unspecified format"})`];
+  deck.cards.forEach((dc) => {
+    const c = Storage.findCard(dc.cardId);
+    if (c) lines.push(`- ${dc.quantity}x ${c.name} — ${c.typeLine || "?"}, CMC ${c.cmc ?? "?"}, ${c.manaCost || ""}`);
+  });
+  (deck.extraCards || []).forEach((c) => lines.push(`- ${c.quantity}x ${c.name} [wishlist, not yet owned] — ${c.typeLine || "?"}, CMC ${c.cmc ?? "?"}`));
+  if (deck.cards.length === 0 && (deck.extraCards || []).length === 0) lines.push("(no cards added yet)");
+  return lines.join("\n");
+}
+
+function renderClippyLog(deckId) {
+  if (!state.clippyHistory[deckId]) state.clippyHistory[deckId] = [];
+  const log = document.getElementById("clippy-log");
+  const history = state.clippyHistory[deckId];
+  log.innerHTML = history.length === 0
+    ? `<div class="clippy-bubble clippy-bubble-them">Hi! I can see this deck's current cards. Ask me about weak spots, combo lines, or what to cut — I'll get sharper the more cards you add to your Codex.</div>`
+    : history.map((m) => `<div class="clippy-bubble ${m.role === "user" ? "clippy-bubble-me" : "clippy-bubble-them"}">${esc(m.content)}</div>`).join("");
+  log.scrollTop = log.scrollHeight;
+}
+
+async function askClippyAbout(deck, deckCardObjects, inputEl) {
+  const message = inputEl.value.trim();
+  if (!message) return;
+  if (!state.clippyHistory[deck.id]) state.clippyHistory[deck.id] = [];
+  const history = state.clippyHistory[deck.id];
+  history.push({ role: "user", content: message });
+  inputEl.value = "";
+  inputEl.disabled = true;
+  renderClippyLog(deck.id);
+  const log = document.getElementById("clippy-log");
+  log.insertAdjacentHTML("beforeend", `<div class="clippy-bubble clippy-bubble-them" id="clippy-thinking">…thinking…</div>`);
+  log.scrollTop = log.scrollHeight;
+  try {
+    const deckContext = buildDeckContext(deck, deckCardObjects);
+    const reply = await Clippy.ask(deckContext, message, history.slice(0, -1));
+    history.push({ role: "assistant", content: reply });
+  } catch (err) {
+    history.push({ role: "assistant", content: `⚠️ ${err.message || "Something went wrong."}` });
+  }
+  inputEl.disabled = false;
+  renderClippyLog(deck.id);
+  inputEl.focus();
 }
 
 // ================= ASSISTANT =================
@@ -562,7 +656,7 @@ function renderAssistant() {
   const select = document.getElementById("assist-deck-select");
   const modeSelect = document.getElementById("assist-mode");
   if (state.currentDeckId) select.value = state.currentDeckId;
-  const trigger = () => runAssistant(select.value, modeSelect.value);
+  const trigger = () => { state.assistOffset = 0; state.assistPage = 1; runAssistant(select.value, modeSelect.value); };
   select.addEventListener("change", trigger);
   modeSelect.addEventListener("change", trigger);
   if (select.value) trigger();
@@ -574,15 +668,15 @@ function runAssistant(deckId, mode) {
   const deck = Storage.findDeck(deckId);
   const deckCardObjects = deck.cards.map((dc) => Storage.findCard(dc.cardId)).filter(Boolean);
   const targetSize = (deck.format || "").toLowerCase() === "commander" ? 100 : 60;
-  const analysis = Assistant.analyzeDeck(deck, deckCardObjects, Storage.allCards(), targetSize);
+  const analysis = Assistant.analyzeDeck(deck, deckCardObjects, Storage.allCards(), targetSize, state.assistOffset);
 
   if (mode === "all") return runAssistantAllCards(deck, deckCardObjects, analysis, targetSize, results);
 
   results.innerHTML = `
-    <h4>Suggestions for ${esc(deck.name)}</h4>
+    <div class="toolbar" style="margin-bottom:.5rem;"><h4 style="margin:0">Suggestions for ${esc(deck.name)}</h4><div class="spacer"></div><button id="cycle-btn">🔄 Show different suggestions</button></div>
     ${
       analysis.suggestions.length === 0
-        ? `<div class="empty-state"><h3>Nothing jumps out</h3><p class="hint">Either this deck looks well-rounded, or your collection doesn't have more cards that fit its colors yet.</p></div>`
+        ? `<div class="empty-state"><h3>${state.assistOffset > 0 ? "That's everything that fits" : "Nothing jumps out"}</h3><p class="hint">${state.assistOffset > 0 ? "You've cycled through everything your collection has for these gaps." : "Either this deck looks well-rounded, or your collection doesn't have more cards that fit its colors yet."}</p></div>`
         : analysis.suggestions.map((s) => `
           <div class="suggestion">
             <div><b>${esc(s.name)}</b><div class="reason">${esc(s.reason)}</div></div>
@@ -590,6 +684,10 @@ function runAssistant(deckId, mode) {
           </div>`).join("")
     }
   `;
+  document.getElementById("cycle-btn").addEventListener("click", () => {
+    state.assistOffset += 3;
+    runAssistant(deckId, mode);
+  });
   results.querySelectorAll("[data-suggest-add]").forEach((btn) =>
     btn.addEventListener("click", () => {
       const cardId = btn.dataset.suggestAdd;
@@ -611,21 +709,25 @@ async function runAssistantAllCards(deck, deckCardObjects, analysis, targetSize,
   const sections = [];
   for (const q of queries) {
     let cards = [];
-    try { cards = await Scryfall.search(q.query); } catch (e) { cards = []; }
+    try { cards = await Scryfall.search(q.query, { page: state.assistPage }); } catch (e) { cards = []; }
     cards = cards.filter((c) => !deckCardObjects.some((dc) => dc.scryfallId === c.scryfallId));
     sections.push({ ...q, cards });
   }
   results.innerHTML = `
-    <h4>Suggestions for ${esc(deck.name)}</h4>
+    <div class="toolbar" style="margin-bottom:.5rem;"><h4 style="margin:0">Suggestions for ${esc(deck.name)}</h4><div class="spacer"></div><button id="cycle-btn">🔄 Show more options</button></div>
     ${sections.map((s) => `
       <h5 style="margin-bottom:.3rem">${esc(s.label)} <span class="hint">— ${esc(s.reason)}</span></h5>
-      ${s.cards.length === 0 ? `<p class="hint">No matches found.</p>` : s.cards.map((c) => `
+      ${s.cards.length === 0 ? `<p class="hint">No more matches.</p>` : s.cards.map((c) => `
         <div class="suggestion">
           <div><b>${esc(c.name)}</b><div class="reason">${esc(c.typeLine || "")}${c.price ? " · $" + Number(c.price).toFixed(2) : ""}</div></div>
           <button data-wishlist-add="${esc(c.scryfallId)}" data-wishlist-idx="${sections.indexOf(s)}">+ Add to deck</button>
         </div>`).join("")}
     `).join("")}
   `;
+  document.getElementById("cycle-btn").addEventListener("click", () => {
+    state.assistPage += 1;
+    runAssistantAllCards(deck, deckCardObjects, analysis, targetSize, results);
+  });
   results.querySelectorAll("[data-wishlist-add]").forEach((btn) => {
     const idx = Number(btn.dataset.wishlistIdx);
     const card = sections[idx].cards.find((c) => c.scryfallId === btn.dataset.wishlistAdd);
@@ -720,93 +822,6 @@ function printLabels() {
   setTimeout(() => (printArea.style.display = "none"), 500);
 }
 
-// ================= SHARING =================
-async function renderSharing() {
-  drawerBody.innerHTML = `<h3>Sharing</h3><p class="hint">Loading…</p>`;
-  let mine = [], sharedWithMe = [];
-  try {
-    [mine, sharedWithMe] = await Promise.all([Storage.listMyCollaborators(), Storage.listSharedWithMe()]);
-  } catch (e) {
-    drawerBody.innerHTML = `<h3>Sharing</h3><p class="hint">Couldn't load sharing info: ${esc(e.message || String(e))}</p>`;
-    return;
-  }
-
-  drawerBody.innerHTML = `
-    <h3>Sharing</h3>
-    <p class="hint">Add someone by the email they signed up with. Give them <b>View</b> to let them browse your collection and decks, or <b>Edit</b> to let them add, change, and file cards too — same as you.</p>
-
-    <div class="row">
-      <div class="field" style="max-width:280px"><label>Their email</label><input id="share-email" type="email" placeholder="friend@example.com"/></div>
-      <div class="field" style="max-width:160px"><label>Access</label>
-        <select id="share-level"><option value="view">View</option><option value="edit">Edit</option></select>
-      </div>
-      <div class="field" style="max-width:120px"><label>&nbsp;</label><button class="primary" id="share-add-btn" style="width:100%">Share</button></div>
-    </div>
-    <p class="hint" id="share-status"></p>
-
-    <h4 style="margin-top:1.5rem">People you've shared your collection with</h4>
-    ${mine.length === 0 ? `<p class="hint">Nobody yet.</p>` : `
-      <table class="deck-table">
-        <thead><tr><th>Email</th><th>Access</th><th></th></tr></thead>
-        <tbody>${mine.map((row) => `
-          <tr>
-            <td>${esc(row.collaborator_email)}</td>
-            <td><select data-perm-row="${row.id}"><option value="view" ${row.permission === "view" ? "selected" : ""}>View</option><option value="edit" ${row.permission === "edit" ? "selected" : ""}>Edit</option></select></td>
-            <td><button class="danger" data-revoke="${row.id}">Remove</button></td>
-          </tr>`).join("")}</tbody>
-      </table>`}
-
-    <h4 style="margin-top:1.5rem">Collections shared with you</h4>
-    ${sharedWithMe.length === 0 ? `<p class="hint">Nobody's shared a collection with you yet.</p>` : `
-      <table class="deck-table">
-        <thead><tr><th>Owner</th><th>Your access</th><th></th></tr></thead>
-        <tbody>${sharedWithMe.map((row) => `
-          <tr>
-            <td>${esc(row.owner_email)}</td>
-            <td>${esc(row.permission)}</td>
-            <td><button data-view-shared="${row.owner_id}" data-perm="${row.permission}">View this collection</button></td>
-          </tr>`).join("")}</tbody>
-      </table>`}
-  `;
-
-  const statusEl = document.getElementById("share-status");
-  document.getElementById("share-add-btn").addEventListener("click", async () => {
-    const email = document.getElementById("share-email").value.trim();
-    const level = document.getElementById("share-level").value;
-    if (!email) return;
-    statusEl.textContent = "Sharing…";
-    try {
-      await Storage.inviteCollaborator(email, level);
-      statusEl.textContent = `Shared with ${email}.`;
-      renderSharing();
-    } catch (e) {
-      statusEl.textContent = e.message || "Couldn't share — check the email and try again.";
-    }
-  });
-
-  drawerBody.querySelectorAll("[data-perm-row]").forEach((sel) =>
-    sel.addEventListener("change", async () => {
-      try { await Storage.updateCollaboratorPermission(sel.dataset.permRow, sel.value); }
-      catch (e) { alert(e.message || "Couldn't update access."); renderSharing(); }
-    })
-  );
-  drawerBody.querySelectorAll("[data-revoke]").forEach((btn) =>
-    btn.addEventListener("click", async () => {
-      if (!confirm("Remove their access to your collection?")) return;
-      try { await Storage.revokeCollaborator(btn.dataset.revoke); renderSharing(); }
-      catch (e) { alert(e.message || "Couldn't remove access."); }
-    })
-  );
-  drawerBody.querySelectorAll("[data-view-shared]").forEach((btn) =>
-    btn.addEventListener("click", async () => {
-      await Storage.switchToOwner(btn.dataset.viewShared, btn.dataset.perm);
-      window.dispatchEvent(new CustomEvent("codex:collection-switched"));
-      state.tab = "collection";
-      render();
-    })
-  );
-}
-
 // ================= IMPORT / EXPORT =================
 function renderIO() {
   drawerBody.innerHTML = `
@@ -820,11 +835,24 @@ function renderIO() {
       <select id="import-mode"><option value="merge">Merge with current data</option><option value="replace">Replace current data</option></select>
     </div>
 
-    <h4 style="margin-top:1.5rem">Collection CSV</h4>
-    <p class="hint">Columns: name, quantity, tags (semicolon-separated), box. Each row is looked up on Scryfall automatically.</p>
+    <h4 style="margin-top:1.5rem">Collection CSV — bulk import a packet</h4>
+    <p class="hint">Columns: name, quantity, tags (semicolon-separated), box. Tell Codex what color this whole batch is — since your packets are already sorted by color, that's more trustworthy than guessing per card, and Codex will flag anything that looks like it doesn't belong.</p>
+    <div class="row">
+      <div class="field" style="max-width:220px">
+        <label>This batch is</label>
+        <select id="import-color">
+          <option value="">Let Codex auto-detect per card</option>
+          ${Storage.CLASS_TABLE.map((c) => `<option value="${c.code}">${esc(c.label)} (${c.code})</option>`).join("")}
+        </select>
+      </div>
+      <div class="field" style="max-width:160px">
+        <label>Box number for this batch</label>
+        <input id="import-box" type="number" min="1" placeholder="e.g. 7"/>
+      </div>
+    </div>
     <div class="toolbar">
       <button id="export-csv-btn">Export collection (CSV)</button>
-      <label class="field" style="margin:0"><button id="import-csv-trigger">Bulk import (CSV)</button><input type="file" id="import-csv-input" accept=".csv" style="display:none"/></label>
+      <label class="field" style="margin:0"><button id="import-csv-trigger">Choose CSV & import</button><input type="file" id="import-csv-input" accept=".csv" style="display:none"/></label>
     </div>
     <div id="import-status" class="hint"></div>
   `;
@@ -863,14 +891,17 @@ function renderIO() {
   document.getElementById("import-csv-input").addEventListener("change", async (e) => {
     const file = e.target.files[0];
     if (!file) return;
+    const declaredColor = document.getElementById("import-color").value; // "" means auto-detect
+    const declaredBox = document.getElementById("import-box").value;
     const text = await file.text();
     const lines = text.split(/\r?\n/).filter(Boolean);
     const header = lines.shift();
     const statusEl = document.getElementById("import-status");
     let done = 0;
+    const mismatches = [];
     for (const line of lines) {
       const cols = parseCsvLine(line);
-      const [name, quantity, tags, box] = cols;
+      const [name, quantity, tags, rowBox] = cols;
       if (!name) continue;
       statusEl.textContent = `Importing "${name}"… (${++done}/${lines.length})`;
       let data;
@@ -881,10 +912,21 @@ function renderIO() {
         quantity: parseInt(quantity, 10) || 1,
         tags: (tags || "").split(";").map((t) => t.trim()).filter(Boolean),
       });
-      if (box) Storage.assignLocation(card.id, parseInt(box, 10) || 1);
+      const box = rowBox || declaredBox;
+      if (box) {
+        if (declaredColor && data.typeLine) {
+          const autoClass = Storage.classFor(data);
+          if (autoClass.code !== declaredColor) {
+            mismatches.push(`${card.name} looked like ${autoClass.label} on Scryfall, filed as ${Storage.classByCode(declaredColor).label} per your batch setting`);
+          }
+        }
+        Storage.assignLocation(card.id, parseInt(box, 10) || 1, declaredColor || undefined);
+      }
       await new Promise((r) => setTimeout(r, 120)); // be polite to Scryfall's API
     }
-    statusEl.textContent = `Done — imported ${done} card(s).`;
+    statusEl.innerHTML = `Done — imported ${done} card(s).` + (mismatches.length
+      ? `<br/><span style="color:#A6473B">Double-check these:</span><br/>` + mismatches.map(esc).join("<br/>")
+      : "");
     render();
   });
 }
@@ -913,3 +955,5 @@ function parseCsvLine(line) {
 export function initApp() {
   render();
 }
+
+initApp();

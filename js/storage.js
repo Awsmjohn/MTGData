@@ -1,11 +1,9 @@
-// storage.js — persistence + the Dewey-inspired location code system
-// Data is synced to Supabase (one row per logged-in user), with a
-// localStorage copy kept per-user as an instant-load / offline cache.
-// Every Storage method below stays synchronous against the in-memory `db`
-// object — see initForUser() for how that object gets populated after login,
-// and save() for how edits get pushed to the cloud in the background.
+// storage.js — persistence + the Dewey-inspired location code system.
+// Everything lives in the browser's localStorage. Export/Import (see the
+// Import·Export tab) is the backup mechanism since localStorage does not
+// sync across devices.
 
-import { supabase } from "./supabaseClient.js";
+const DB_KEY = "codex.db.v1";
 
 const CLASS_TABLE = [
   { code: "000", label: "Artifact / Colorless", test: (c) => c.colors.length === 0 && !c.isLand && !c.isToken },
@@ -26,7 +24,6 @@ function classFor(card) {
     isLand: (card.typeLine || "").includes("Land"),
     isToken: (card.typeLine || "").includes("Token") || (card.typeLine || "").includes("Emblem"),
   };
-  // Land check takes priority over color (many lands have color identity but no colors[])
   if (shaped.isLand) return CLASS_TABLE.find((c) => c.code === "700");
   if (shaped.isToken) return CLASS_TABLE.find((c) => c.code === "800");
   for (const entry of CLASS_TABLE) {
@@ -35,15 +32,18 @@ function classFor(card) {
   return CLASS_TABLE[CLASS_TABLE.length - 1];
 }
 
+function classByCode(code) {
+  return CLASS_TABLE.find((c) => c.code === code) || null;
+}
+
 function pad(n, len) {
   return String(n).padStart(len, "0");
 }
 
 // Derives tags straight from Scryfall data: keyword abilities (Flying,
 // Trample, ...) and creature/land subtypes (Elf, Goblin, Desert, ...) pulled
-// from the back half of the type line. These are recomputed from the card's
-// stored Scryfall data and kept separate from your own custom tags, so a
-// refresh never wipes out tags you typed yourself.
+// from the back half of the type line. Kept separate from your own custom
+// tags, so a refresh never wipes out tags you typed yourself.
 function computeAutoTags(card) {
   const tags = new Set();
   (card.keywords || []).forEach((k) => tags.add(k));
@@ -57,8 +57,8 @@ function computeAutoTags(card) {
 
 function defaultDB() {
   return {
-    cards: [], // {id, name, set, setCode, collectorNumber, manaCost, cmc, colors, colorIdentity, typeLine, oracleText, power, toughness, loyalty, rarity, imageUrl, scryfallId, legalities, quantity, tags, locationCode, dateAdded}
-    decks: [], // {id, name, format, cards:[{cardId, quantity}], notes, dateCreated}
+    cards: [], // {id, name, set, setCode, collectorNumber, manaCost, cmc, colors, colorIdentity, typeLine, oracleText, power, toughness, loyalty, rarity, imageUrl, scryfallId, legalities, price, quantity, tags, autoTags, locationCode, box, dateAdded}
+    decks: [], // {id, name, format, cards:[{cardId, quantity}], extraCards:[], notes, dateCreated}
     settings: {
       numberOfBoxes: 10,
       sequences: {}, // key `${classCode}-${box}` -> next sequence number
@@ -66,173 +66,39 @@ function defaultDB() {
   };
 }
 
-function mergeWithDefaults(parsed) {
-  return { ...defaultDB(), ...parsed, settings: { ...defaultDB().settings, ...(parsed.settings || {}) } };
-}
-
-let db = defaultDB();
-let currentUserId = null; // the logged-in person
-let currentUserEmail = null;
-let activeOwnerId = null; // whose codex_data row is currently loaded — equals currentUserId unless viewing a shared collection
-let activePermission = "owner"; // "owner" | "edit" | "view"
-let cloudSaveTimer = null;
-let onSyncStatus = () => {}; // optional callback: (status) => void, "saved" | "saving" | "error" | "readonly-blocked"
-
-function cacheKeyFor(userId) {
-  return `codex.db.v1.${userId}`;
-}
-
-function writeLocalCache() {
-  if (!currentUserId || activeOwnerId !== currentUserId) return; // only cache your own collection locally
+function load() {
   try {
-    localStorage.setItem(cacheKeyFor(currentUserId), JSON.stringify(db));
+    const raw = localStorage.getItem(DB_KEY);
+    if (!raw) return defaultDB();
+    const parsed = JSON.parse(raw);
+    return { ...defaultDB(), ...parsed, settings: { ...defaultDB().settings, ...(parsed.settings || {}) } };
   } catch (e) {
-    console.warn("Local cache write failed", e);
+    console.error("Failed to load Codex database, starting fresh.", e);
+    return defaultDB();
   }
 }
 
-async function pushToCloud() {
-  if (!activeOwnerId) return;
-  onSyncStatus("saving");
-  const { error } = await supabase
-    .from("codex_data")
-    .upsert({ user_id: activeOwnerId, data: db, updated_at: new Date().toISOString() });
-  onSyncStatus(error ? "error" : "saved");
-  if (error) console.error("Supabase save failed", error);
+function save(db) {
+  localStorage.setItem(DB_KEY, JSON.stringify(db));
 }
 
-function save(db_) {
-  writeLocalCache();
-  clearTimeout(cloudSaveTimer);
-  cloudSaveTimer = setTimeout(pushToCloud, 800); // debounce rapid edits into one write
-}
+let db = load();
 
 function uid() {
   return "id-" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 }
 
-const StorageImpl = {
-  // Called once after a successful login. Loads this user's data from
-  // Supabase (falling back to a local cache for instant paint, and to a
-  // fresh empty database for a brand-new account).
-  async initForUser(userId, email, statusCallback) {
-    currentUserId = userId;
-    currentUserEmail = email;
-    activeOwnerId = userId;
-    activePermission = "owner";
-    onSyncStatus = statusCallback || (() => {});
-    try {
-      const cached = localStorage.getItem(cacheKeyFor(userId));
-      if (cached) db = mergeWithDefaults(JSON.parse(cached));
-    } catch (e) { /* ignore bad cache */ }
-
-    const { data, error } = await supabase.from("codex_data").select("data").eq("user_id", userId).maybeSingle();
-    if (error) {
-      console.error("Failed to load from Supabase, using local cache if any.", error);
-      onSyncStatus("error");
-      return;
-    }
-    if (data && data.data) {
-      db = mergeWithDefaults(data.data);
-      writeLocalCache();
-    } else {
-      // Brand-new account — create their row.
-      db = defaultDB();
-      await pushToCloud();
-    }
-    onSyncStatus("saved");
-  },
-
-  signOut() {
-    currentUserId = null;
-    currentUserEmail = null;
-    activeOwnerId = null;
-    activePermission = "owner";
-    db = defaultDB();
-  },
-
-  getMyUserId() {
-    return currentUserId;
-  },
-
-  getActiveOwnerId() {
-    return activeOwnerId;
-  },
-
-  isViewingOwnCollection() {
-    return activeOwnerId === currentUserId;
-  },
-
-  isReadOnly() {
-    return activePermission === "view";
-  },
-
-  getActivePermission() {
-    return activePermission;
-  },
-
-  // ---- Sharing ----
-  // People you've shared your OWN collection with.
-  async listMyCollaborators() {
-    const { data, error } = await supabase.from("collaborators").select("*").eq("owner_id", currentUserId).order("collaborator_email");
-    if (error) throw error;
-    return data || [];
-  },
-
-  // Collections other people have shared with you.
-  async listSharedWithMe() {
-    const { data, error } = await supabase.from("collaborators").select("*").eq("collaborator_id", currentUserId).order("owner_email");
-    if (error) throw error;
-    return data || [];
-  },
-
-  async inviteCollaborator(email, accessLevel) {
-    const { error } = await supabase.rpc("invite_collaborator", { collaborator_email: email.trim(), access_level: accessLevel });
-    if (error) throw error;
-  },
-
-  async updateCollaboratorPermission(rowId, accessLevel) {
-    const { error } = await supabase.from("collaborators").update({ permission: accessLevel }).eq("id", rowId);
-    if (error) throw error;
-  },
-
-  async revokeCollaborator(rowId) {
-    const { error } = await supabase.from("collaborators").delete().eq("id", rowId);
-    if (error) throw error;
-  },
-
-  // Switch which collection is currently loaded — your own, or one shared with you.
-  async switchToOwner(ownerId, permission, statusCallback) {
-    if (statusCallback) onSyncStatus = statusCallback;
-    activeOwnerId = ownerId;
-    activePermission = ownerId === currentUserId ? "owner" : permission;
-    const { data, error } = await supabase.from("codex_data").select("data").eq("user_id", ownerId).maybeSingle();
-    if (error) {
-      console.error("Failed to load that shared collection.", error);
-      onSyncStatus("error");
-      db = defaultDB();
-      return;
-    }
-    db = data && data.data ? mergeWithDefaults(data.data) : defaultDB();
-    writeLocalCache();
-    onSyncStatus("saved");
-  },
-
-  async switchToMine(statusCallback) {
-    return this.switchToOwner(currentUserId, "owner", statusCallback);
-  },
-
+export const Storage = {
   getDB() {
     return db;
   },
 
   replaceDB(newDB) {
-    db = mergeWithDefaults(newDB);
+    db = { ...defaultDB(), ...newDB, settings: { ...defaultDB().settings, ...(newDB.settings || {}) } };
     save(db);
   },
 
   mergeDB(incoming) {
-    // Merge cards by scryfallId+set (or name if no id), decks by name.
     const existingKey = (c) => (c.scryfallId ? c.scryfallId : c.name.toLowerCase());
     const existingKeys = new Set(db.cards.map(existingKey));
     (incoming.cards || []).forEach((c) => {
@@ -256,8 +122,8 @@ const StorageImpl = {
     const record = {
       id: uid(),
       quantity: 1,
-      tags: [], // your own custom tags
-      autoTags: [], // derived from Scryfall keywords/subtypes, recomputed on save
+      tags: [],
+      autoTags: [],
       locationCode: null,
       dateAdded: new Date().toISOString(),
       ...card,
@@ -277,10 +143,6 @@ const StorageImpl = {
     return c;
   },
 
-  allTagsFor(card) {
-    return Array.from(new Set([...(card.tags || []), ...(card.autoTags || [])]));
-  },
-
   deleteCard(id) {
     db.cards = db.cards.filter((c) => c.id !== id);
     db.decks.forEach((d) => (d.cards = d.cards.filter((dc) => dc.cardId !== id)));
@@ -293,6 +155,10 @@ const StorageImpl = {
 
   findCard(id) {
     return db.cards.find((c) => c.id === id) || null;
+  },
+
+  allTagsFor(card) {
+    return Array.from(new Set([...(card.tags || []), ...(card.autoTags || [])]));
   },
 
   // ---- Decks ----
@@ -338,10 +204,6 @@ const StorageImpl = {
     save(db);
   },
 
-  // "Extra" cards: cards added straight to a deck from a general Scryfall
-  // search, whether or not you own a physical copy. Each carries its own
-  // snapshot of Scryfall data (name, price, colors, etc.) since it may not
-  // exist anywhere in the Collection.
   addExtraCard(deckId, cardData, quantity = 1) {
     const deck = this.findDeck(deckId);
     if (!deck) return;
@@ -390,12 +252,16 @@ const StorageImpl = {
 
   // ---- Location codes (Dewey-inspired) ----
   classFor,
+  classByCode,
   CLASS_TABLE,
 
-  assignLocation(cardId, box) {
+  // classCodeOverride lets a bulk import declare "this whole batch is Green"
+  // etc. instead of trusting only the auto-detected class — useful since you
+  // know your own physical piles better than any heuristic can.
+  assignLocation(cardId, box, classCodeOverride) {
     const card = this.findCard(cardId);
     if (!card) return null;
-    const cls = classFor(card);
+    const cls = classCodeOverride ? classByCode(classCodeOverride) || classFor(card) : classFor(card);
     const boxNum = pad(box, 2);
     const seqKey = `${cls.code}-${boxNum}`;
     const next = (db.settings.sequences[seqKey] || 0) + 1;
@@ -432,30 +298,3 @@ const StorageImpl = {
     return counts;
   },
 };
-
-// Every method below is a real database write. When the active collection
-// is someone else's and you only have "view" access, these are blocked here
-// — as a safety net for the UI — on top of the database's own Row Level
-// Security policies, which are the actual enforcement boundary.
-const MUTATING_METHODS = new Set([
-  "replaceDB", "mergeDB", "addCard", "updateCard", "deleteCard",
-  "addDeck", "updateDeck", "deleteDeck", "setDeckCardQty",
-  "addExtraCard", "setExtraCardQty", "updateSettings",
-  "assignLocation", "clearLocation",
-]);
-
-export const Storage = new Proxy(StorageImpl, {
-  get(target, prop) {
-    const value = target[prop];
-    if (typeof value !== "function") return value;
-    if (!MUTATING_METHODS.has(prop)) return value.bind(target);
-    return (...args) => {
-      if (activePermission === "view") {
-        console.warn(`Blocked "${String(prop)}" — you have view-only access to this collection.`);
-        onSyncStatus("readonly-blocked");
-        return null;
-      }
-      return value.apply(target, args);
-    };
-  },
-});

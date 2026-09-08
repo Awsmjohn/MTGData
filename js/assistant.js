@@ -44,7 +44,7 @@ function curveBuckets(nonlandDeckCards) {
  * @param {object[]} collection - all cards in the collection, each with .quantity (owned count)
  * @param {number} targetSize - total deck size the format expects (60 constructed, 99+1 commander, etc.)
  */
-function analyzeDeck(deck, deckCardObjects, collection, targetSize = 60) {
+function analyzeDeck(deck, deckCardObjects, collection, targetSize = 60, offset = 0) {
   const suggestions = [];
   const identity = colorIdentityOf(deckCardObjects);
   const deckIds = new Set(deckCardObjects.map((c) => c.id));
@@ -70,7 +70,7 @@ function analyzeDeck(deck, deckCardObjects, collection, targetSize = 60) {
   const targetRemoval = Math.max(4, Math.round(targetSize * 0.12));
   if (removalInDeck < targetRemoval) {
     const pool = candidates.filter((c) => !isLand(c) && REMOVAL_RE.test(c.oracleText || ""));
-    pool.slice(0, 3).forEach((c) =>
+    pool.slice(offset, offset + 3).forEach((c) =>
       suggestions.push({
         cardId: c.id,
         name: c.name,
@@ -85,7 +85,7 @@ function analyzeDeck(deck, deckCardObjects, collection, targetSize = 60) {
   const targetDraw = Math.max(3, Math.round(targetSize * 0.08));
   if (drawInDeck < targetDraw) {
     const pool = candidates.filter((c) => !isLand(c) && DRAW_RE.test(c.oracleText || ""));
-    pool.slice(0, 2).forEach((c) =>
+    pool.slice(offset, offset + 2).forEach((c) =>
       suggestions.push({
         cardId: c.id,
         name: c.name,
@@ -109,7 +109,7 @@ function analyzeDeck(deck, deckCardObjects, collection, targetSize = 60) {
         if (bucket === "6+") return cmc >= 6;
         return String(cmc) === bucket;
       });
-      pool.slice(0, 1).forEach((c) =>
+      pool.slice(offset, offset + 1).forEach((c) =>
         suggestions.push({
           cardId: c.id,
           name: c.name,
@@ -126,7 +126,7 @@ function analyzeDeck(deck, deckCardObjects, collection, targetSize = 60) {
     const rampInDeck = nonlandDeck.filter((c) => RAMP_RE.test(c.oracleText || "")).length;
     if (rampInDeck < 3) {
       const pool = candidates.filter((c) => !isLand(c) && RAMP_RE.test(c.oracleText || ""));
-      pool.slice(0, 2).forEach((c) =>
+      pool.slice(offset, offset + 2).forEach((c) =>
         suggestions.push({
           cardId: c.id,
           name: c.name,
@@ -142,7 +142,7 @@ function analyzeDeck(deck, deckCardObjects, collection, targetSize = 60) {
     const hasWrath = nonlandDeck.some((c) => WRATH_RE.test(c.oracleText || ""));
     if (!hasWrath) {
       const pool = candidates.filter((c) => !isLand(c) && WRATH_RE.test(c.oracleText || ""));
-      pool.slice(0, 1).forEach((c) =>
+      pool.slice(offset, offset + 1).forEach((c) =>
         suggestions.push({
           cardId: c.id,
           name: c.name,
@@ -159,7 +159,7 @@ function analyzeDeck(deck, deckCardObjects, collection, targetSize = 60) {
   const landCount = landDeck.reduce((s, c) => s + (usedQty[c.id] || 1), 0);
   if (landCount < landTarget - 1) {
     const pool = candidates.filter((c) => isLand(c));
-    pool.slice(0, 3).forEach((c) =>
+    pool.slice(offset, offset + 3).forEach((c) =>
       suggestions.push({
         cardId: c.id,
         name: c.name,
@@ -179,7 +179,7 @@ function analyzeDeck(deck, deckCardObjects, collection, targetSize = 60) {
     .filter(([, count]) => count >= 2)
     .forEach(([tag]) => {
       const pool = candidates.filter((c) => tagsOf(c).includes(tag));
-      pool.slice(0, 2).forEach((c) =>
+      pool.slice(offset, offset + 2).forEach((c) =>
         suggestions.push({
           cardId: c.id,
           name: c.name,

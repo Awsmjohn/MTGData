@@ -12,8 +12,16 @@ async function autocomplete(query) {
   return data.data || [];
 }
 
-async function search(query, { order = "edhrec", limit = 6 } = {}) {
-  const url = `${BASE}/cards/search?q=${encodeURIComponent(query)}&order=${order}&unique=cards`;
+async function getPrintings(name) {
+  const url = `${BASE}/cards/search?q=${encodeURIComponent(`!"${name}"`)}&unique=prints&order=released&dir=desc`;
+  const res = await fetch(url);
+  if (!res.ok) return [];
+  const data = await res.json();
+  return (data.data || []).map(shapeCard);
+}
+
+async function search(query, { order = "edhrec", limit = 6, page = 1 } = {}) {
+  const url = `${BASE}/cards/search?q=${encodeURIComponent(query)}&order=${order}&unique=cards&page=${page}`;
   const res = await fetch(url);
   if (!res.ok) return [];
   const data = await res.json();
@@ -63,4 +71,4 @@ async function getByFuzzyName(name) {
   return shapeCard(raw);
 }
 
-export const Scryfall = { autocomplete, getByExactName, getByFuzzyName, search, shapeCard };
+export const Scryfall = { autocomplete, getByExactName, getByFuzzyName, search, getPrintings, shapeCard };
